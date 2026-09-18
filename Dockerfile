@@ -20,7 +20,7 @@ RUN set -eux; \
     gunzip chisel.gz; \
     chmod +x chisel
 
-FROM vllm/vllm-openai:nightly
+FROM vllm/vllm-openai@sha256:43f13b4c624ab9e9e6753d0eeb5953268bff334f2a826239e6f4a2197d47bb96
 
 COPY flash-next-vllm.patch /tmp/
 COPY flash-next-decode-01-ple-host-gather.patch /tmp/
