@@ -20,35 +20,7 @@ RUN set -eux; \
     gunzip chisel.gz; \
     chmod +x chisel
 
-FROM vllm/vllm-openai@sha256:43f13b4c624ab9e9e6753d0eeb5953268bff334f2a826239e6f4a2197d47bb96
-
-COPY flash-next-vllm.patch /tmp/
-COPY flash-next-decode-01-ple-host-gather.patch /tmp/
-COPY flash-next-decode-02-model-state-hook.patch /tmp/
-COPY flash-next-mtp-01-enable.patch /tmp/
-COPY flash-next-mtp-02-prefix-cache.patch /tmp/
-RUN cd /usr/local/lib/python3.12/dist-packages \
-    && patch -p1 --batch --forward < /tmp/flash-next-vllm.patch \
-    && patch -p1 --batch --forward < /tmp/flash-next-decode-01-ple-host-gather.patch \
-    && patch -p1 --batch --forward < /tmp/flash-next-decode-02-model-state-hook.patch \
-    && patch -p1 --batch --forward < /tmp/flash-next-mtp-01-enable.patch \
-    && patch -p1 --batch --forward < /tmp/flash-next-mtp-02-prefix-cache.patch \
-    && rm /tmp/flash-next-vllm.patch \
-          /tmp/flash-next-decode-01-ple-host-gather.patch \
-          /tmp/flash-next-decode-02-model-state-hook.patch \
-          /tmp/flash-next-mtp-01-enable.patch \
-          /tmp/flash-next-mtp-02-prefix-cache.patch \
-    && python3 -m py_compile \
-        vllm/models/qwen4_exp/nvidia/model.py \
-        vllm/models/qwen4_exp/nvidia/hyperconnection.py \
-        vllm/models/qwen4_exp/nvidia/ngram_embedding.py \
-        vllm/models/qwen4_exp/nvidia/model_state.py \
-        vllm/models/qwen4_exp/nvidia/mtp.py \
-        vllm/models/qwen4_exp/nvidia/qsa.py \
-        vllm/models/qwen4_exp/nvidia/ops/qsa.py \
-        vllm/model_executor/models/config.py \
-        vllm/v1/core/kv_cache_utils.py \
-        vllm/platforms/interface.py
+FROM vllm/vllm-openai:nightly
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \

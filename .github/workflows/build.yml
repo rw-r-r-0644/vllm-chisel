@@ -2,8 +2,10 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, qwen]
     tags: ['v*']
+  schedule:
+    - cron: '0 3 * * 0'
   workflow_dispatch:
 
 jobs:
@@ -49,5 +51,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
