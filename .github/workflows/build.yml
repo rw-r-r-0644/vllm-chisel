@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +27,13 @@ jobs:
           haskell: true
           large-packages: true
           swap-storage: true
+
+      - name: install apptainer
+        run: |
+          curl -fsSL -o /tmp/apptainer.deb https://github.com/apptainer/apptainer/releases/download/v1.3.6/apptainer_1.3.6_amd64.deb
+          echo "2723b2928cfc30edf687723c49556ec4e013f0bf7cdb43a5a76bca7bd3c70792  /tmp/apptainer.deb" | sha256sum -c -
+          sudo apt-get update
+          sudo apt-get install -y /tmp/apptainer.deb
 
       - uses: docker/setup-buildx-action@v3
 
@@ -54,3 +61,31 @@ jobs:
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - id: sif
+        run: |
+          if [ "${{ github.ref_type }}" = "branch" ]; then branch="${{ github.ref_name }}"; else branch=main; fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "file=vllm-chisel-$branch.sif" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository }}:$branch" >> "$GITHUB_OUTPUT"
+
+      - run: docker buildx prune -af
+
+      - name: build sif
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo apptainer registry login -u "${{ github.actor }}" --password-stdin docker://ghcr.io
+          sudo apptainer build "${{ steps.sif.outputs.file }}" "docker://${{ steps.sif.outputs.image }}"
+          sudo rm -rf /root/.apptainer
+          sudo chown "$(id -u):$(id -g)" "${{ steps.sif.outputs.file }}"
+          split -d -b 1900M "${{ steps.sif.outputs.file }}" "${{ steps.sif.outputs.file }}.part-"
+          rm "${{ steps.sif.outputs.file }}"
+
+      - name: publish sif
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=sif
+          file="${{ steps.sif.outputs.file }}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --title sif --notes "rolling singularity images" || true
+          for a in $(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null | grep "^$file.part-" || true); do gh release delete-asset "$tag" "$a" -y || true; done
+          gh release upload "$tag" "$file".part-* --clobber
