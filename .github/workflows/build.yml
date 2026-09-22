@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, qwen]
+    branches: [main, qwen, mimo26]
     tags: ['v*']
   schedule:
     - cron: '0 3 * * 0'
