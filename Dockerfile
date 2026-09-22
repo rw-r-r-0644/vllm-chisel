@@ -20,7 +20,7 @@ RUN set -eux; \
     gunzip chisel.gz; \
     chmod +x chisel
 
-FROM vllm/vllm-openai:nightly
+FROM vllm/vllm-openai:mimo-v26
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
