@@ -31,4 +31,4 @@ optional:
 vllm runs in the foreground, chisel runs in the background and reconnects on disconnect.
 
 ## last update
-20261012
+20261015
