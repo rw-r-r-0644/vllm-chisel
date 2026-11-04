@@ -1,6 +1,10 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
 diff -ruN base/vllm/models/qwen4_exp/nvidia/mtp.py mtp/vllm/models/qwen4_exp/nvidia/mtp.py
---- a/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-17 01:04:38.808712367 +0900
-+++ b/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-17 01:07:41.834013735 +0900
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-23 02:43:10.818964043 +0900
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-23 02:43:10.842275131 +0900
 @@ -182,11 +182,21 @@
          self.hidden_size = config.hidden_size
          self.hc_count = config.hc_count
@@ -56,9 +60,9 @@ diff -ruN base/vllm/models/qwen4_exp/nvidia/mtp.py mtp/vllm/models/qwen4_exp/nvi
                  )
          else:
 diff -ruN base/vllm/models/qwen4_exp/nvidia/qsa.py mtp/vllm/models/qwen4_exp/nvidia/qsa.py
---- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-17 01:04:38.808638695 +0900
-+++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-17 01:07:41.833610888 +0900
-@@ -385,13 +385,31 @@
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-23 02:43:10.820099853 +0900
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-23 02:43:10.842430852 +0900
+@@ -526,13 +526,31 @@
          self._qsa_offload_layers = sum(
              kind == "full_attention" for kind in config.layer_types
          )
@@ -92,11 +96,11 @@ diff -ruN base/vllm/models/qwen4_exp/nvidia/qsa.py mtp/vllm/models/qwen4_exp/nvi
 +                    1 + vllm_config.num_speculative_tokens,
 +                )
          self._qsa_stage_min_rows = _QSA_STAGE_MIN_ROWS
-         self._qsa_stage_arena_bytes = int(
-             os.environ.get("VLLM_QSA_KVO_ARENA", str(192 * 1024 * 1024))
+         # 0 turns staging off, and every prefill row then reads host K/V
+         # directly (about 4x slower prefill at long context).
 diff -ruN base/vllm/platforms/interface.py mtp/vllm/platforms/interface.py
---- a/vllm/platforms/interface.py	2026-09-17 01:04:38.809861122 +0900
-+++ b/vllm/platforms/interface.py	2026-09-17 01:07:41.833873505 +0900
+--- a/vllm/platforms/interface.py	2026-09-23 02:43:10.821212208 +0900
++++ b/vllm/platforms/interface.py	2026-09-23 02:43:10.842641157 +0900
 @@ -96,6 +96,15 @@
          return None
      pp_size = vllm_config.parallel_config.pipeline_parallel_size

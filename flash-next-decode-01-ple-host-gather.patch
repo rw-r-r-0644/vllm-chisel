@@ -1,6 +1,10 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
 --- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
 +++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-@@ -573,6 +573,7 @@
+@@ -579,6 +579,7 @@
  
  _PLE_MMAP_PATH_ENV = "VLLM_PLE_MMAP_PATH"
  _PLE_MMAP_REBUILD_ENV = "VLLM_PLE_MMAP_REBUILD"
@@ -8,30 +12,27 @@
  
  # numpy has no bfloat16, so rows are gathered through a same-width int view.
  _PLE_STORAGE_NUMPY_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
-@@ -589,8 +590,20 @@
-     existing one of the expected size is mapped copy-on-write and left alone.
+@@ -597,8 +598,17 @@
+     Completion requires every checkpoint row, across all loader visits.
      ``VLLM_PLE_MMAP_REBUILD=1`` forces a refill.
  
--    Requires ETP=1 and a cudagraph mode of NONE, or PIECEWISE with
--    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``; both are checked here.
-+    Requires ETP=1, checked here.
+-    Requires ETP=1, and cudagraph mode NONE or PIECEWISE with
+-    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``.
++    Requires ETP=1.
 +
-+    The lookup is a host-side gather and cannot run inside a captured CUDA
-+    graph -- so it does not run there. ``Qwen4ExpModelState.prepare_inputs``
-+    calls :meth:`host_gather` before the forward begins, and :meth:`forward`
-+    only reads the buffer it filled. Every cudagraph mode therefore works,
-+    ``FULL_DECODE_ONLY`` included; a PIECEWISE mode still needs
-+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for the eager breaks the GDN, QSA and
-+    short-conv layers rely on.
++    The gather reads the ids on the host, so it cannot run inside a CUDA
++    graph. ``Qwen4ExpModelState.prepare_inputs`` calls :meth:`host_gather`
++    before the forward, and :meth:`forward` only reads the filled buffer. This
++    works with every cudagraph mode, including ``FULL_DECODE_ONLY``. PIECEWISE
++    modes also need ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for the eager breaks in
++    the GDN, QSA and short-conv layers.
 +
-+    ``VLLM_PLE_HOST_GATHER=0`` puts the gather back inside the forward, which
-+    is the behaviour of earlier releases. It restores the old restriction that
-+    FULL cudagraph modes are rejected, and it costs roughly 45% of single
-+    stream decode throughput. It exists to A/B the change on one build.
++    ``VLLM_PLE_HOST_GATHER=0`` runs the gather inside the forward as earlier
++    releases did, for A/B tests. FULL cudagraph modes are then rejected.
      """
  
      def __init__(
-@@ -634,25 +647,38 @@
+@@ -642,25 +652,34 @@
                  f"holds the whole table; got ETP={self.tp_size}"
              )
  
@@ -46,9 +47,6 @@
  
          cg_mode = get_current_vllm_config().compilation_config.cudagraph_mode
 -        if cg_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
-+        # FULL is allowed because host_gather() runs before the forward, which
-+        # leaves forward() a plain device read at a fixed address. With the
-+        # gather back inside the forward it cannot be captured at all.
 +        if not self.prefetch_from_model_state and cg_mode.has_full_cudagraphs():
              raise RuntimeError(
 -                "mmap PLE requires cudagraph_mode NONE or PIECEWISE, not FULL"
@@ -68,42 +66,31 @@
          self._block_d = triton.next_power_of_2(self.embedding_dim)
          self._prefetch_stream = torch.cuda.Stream(device=device)
 -        self._prefetch_buffer = torch.empty(
-+        # host_gather() fills this and forward() returns a view of it, so it is
-+        # allocated once and never reallocated: a cudagraph replay reads the
-+        # same address every time. Zeroed rather than uninitialised so that a
-+        # forward running before the first gather sees zeros.
++        # forward() returns a view of this buffer. It is allocated once so graph
++        # replays read a fixed address, and zeroed so a forward that runs
++        # before the first gather reads zeros.
 +        self._prefetch_buffer = torch.zeros(
              max_total_tokens * self.etp_data_parallel_size,
              num_ngram_heads,
              self.embedding_dim,
-@@ -791,6 +817,60 @@
+@@ -834,6 +853,48 @@
              )
          return output
  
-+    prefetch_from_model_state: bool      # set from the environment in __init__
++    prefetch_from_model_state: bool      # set in __init__ from VLLM_PLE_HOST_GATHER
 +
-+    # The gather runs before the forward, not inside it.
-+    #
-+    # _lookup() stops the host until the ids reach the CPU. Done inside the
-+    # forward, that sync every step destroys the run-ahead that vLLM V2 plus
-+    # async scheduling is built on: the host never gets far enough ahead of the
-+    # GPU, and the per-layer eager islands (12 GDN + 4 QSA + 1 PLE short conv
-+    # per rank) surface as GPU gaps instead of hiding behind the compute. On
-+    # 3 x RTX 3090 that capped single stream decode at 45 tok/s against a
-+    # 12.6 ms GPU-busy floor; hoisting the gather and enabling FULL_DECODE_ONLY
-+    # measured 80 tok/s.
-+    #
-+    # Note that hoisting alone changes nothing (measured 45.1 tok/s): under
-+    # PIECEWISE the eager islands still follow the sync. The value of the hoist
-+    # is that it makes a FULL cudagraph mode legal, and that is what pays.
++    # Measured on 3 x RTX 3090. Inside the forward, the device-to-host copy of
++    # the ids blocks the host every step. The host cannot run ahead of the GPU,
++    # and the eager segments on each rank (12 GDN, 4 QSA, 1 PLE short conv)
++    # become GPU idle time. Single-stream decode was 45 tok/s with a GPU-busy
++    # floor of 12.6 ms. Moving the gather out of the forward alone gave
++    # 45.1 tok/s. Moving it out and using FULL_DECODE_ONLY gave 80 tok/s.
 +
 +    def host_gather(self, ngram_ids: torch.Tensor) -> None:
-+        """Fill the lookup buffer from the host. Runs OUTSIDE the forward.
++        """Fill the lookup buffer. Called before the forward.
 +
-+        The same work start_prefetch() used to do, minus the side stream: the
-+        H2D copy lands on the calling stream, which is the stream the forward
-+        (or its cudagraph replay) runs on immediately afterwards, so ordering
-+        is implicit and no event is needed.
++        The H2D copy runs on the calling stream, which the forward or its graph
++        replay uses next, so no event is needed.
 +        """
 +        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
 +        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
@@ -117,18 +104,16 @@
 +        hidden_states: torch.Tensor,
 +        ngram_ids: torch.Tensor,
 +    ) -> None:
-+        """No-op once host_gather() owns the lookup; the old path otherwise."""
++        """Old in-forward path. Does nothing when host_gather() is used."""
 +        if self.prefetch_from_model_state:
 +            return
 +        super().start_prefetch(hidden_states, ngram_ids)
 +
 +    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-+        """Return the rows host_gather() staged for this batch.
++        """Return a view of the rows host_gather() wrote.
 +
-+        A view, so the address is fixed and the read can be captured. ETP is 1
-+        for this backend (__init__ enforces it), which makes the ETP all-reduce
-+        and the DP row selection that _finalize_prefetch performs both
-+        identities -- all that remains of it is the flatten(-2).
++        With ETP=1 the all-reduce and DP row selection in _finalize_prefetch do
++        nothing, so only the flatten(-2) remains.
 +        """
 +        if not self.prefetch_from_model_state:
 +            return super().forward(hidden_states)
@@ -137,7 +122,7 @@
  
  class Qwen4ExpNGramEmbedding(nn.Module):
      _MASK64 = (1 << 64) - 1
-@@ -1110,6 +1190,30 @@
+@@ -1153,6 +1214,27 @@
          ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
          return self.ngram_embedding(ngram_ids).flatten(-2)
  
@@ -147,13 +132,10 @@
 +        query_start_loc: torch.Tensor,
 +        ngram_context: torch.Tensor,
 +    ) -> None:
-+        """Fill the PLE lookup buffer from the host, before the forward.
++        """Compute the n-gram ids and run the mmap backend's host_gather().
 +
-+        Called by Qwen4ExpModelState.prepare_inputs. Only the mmap backend
-+        wants it: its gather reads the ids on the CPU, and doing that inside
-+        the forward synchronises the host with the device on every step. A
-+        no-op for the device and pinned backends, which prefetch from inside
-+        the forward.
++        Called from Qwen4ExpModelState.prepare_inputs. Does nothing for the
++        device and pinned backends.
 +        """
 +        embedding = self.ngram_embedding
 +        if not getattr(embedding, "prefetch_from_model_state", False):
@@ -168,13 +150,13 @@
      def start_prefetch(
          self,
          hidden_states: torch.Tensor,
-@@ -1121,6 +1225,10 @@
+@@ -1164,6 +1246,10 @@
          embedding = self.ngram_embedding
          if not embedding.supports_prefetch:
              return
 +        if getattr(embedding, "prefetch_from_model_state", False):
-+            # host_gather() already ran. Recomputing the ids here would put a
-+            # kernel back into every forward, and so into every graph replay.
++            # host_gather() already ran. Computing the ids again would add a
++            # kernel to every forward.
 +            return
          ngram_ids = self.compute_ngram_ids(
              input_ids,

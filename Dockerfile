@@ -25,30 +25,65 @@ FROM vllm/vllm-openai@sha256:43f13b4c624ab9e9e6753d0eeb5953268bff334f2a826239e6f
 COPY flash-next-vllm.patch /tmp/
 COPY flash-next-decode-01-ple-host-gather.patch /tmp/
 COPY flash-next-decode-02-model-state-hook.patch /tmp/
+COPY flash-next-ttft-01-ple-page-prefetch.patch /tmp/
+COPY flash-next-decode-03-pp-deferred-recv.patch /tmp/
+COPY flash-next-decode-04-hc-fused-int8.patch /tmp/
+COPY flash-next-decode-05-moe-fused.patch /tmp/
+COPY flash-next-decode-06-ple-gather-advise.patch /tmp/
+COPY flash-next-decode-07-qsa-row-cache.patch /tmp/
+COPY flash-next-mem-01-pp-embed-head.patch /tmp/
+COPY flash-next-vision-01-streamed-tower.patch /tmp/
+COPY flash-next-upstream-01-mamba-align-req-slot.patch /tmp/
 COPY flash-next-mtp-01-enable.patch /tmp/
-COPY flash-next-mtp-02-prefix-cache.patch /tmp/
+COPY flash-next-mtp-02-three-cards.patch /tmp/
+COPY flash-next-mtp-03-structured-output-drafts.patch /tmp/
 RUN cd /usr/local/lib/python3.12/dist-packages \
     && patch -p1 --batch --forward < /tmp/flash-next-vllm.patch \
     && patch -p1 --batch --forward < /tmp/flash-next-decode-01-ple-host-gather.patch \
     && patch -p1 --batch --forward < /tmp/flash-next-decode-02-model-state-hook.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-ttft-01-ple-page-prefetch.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-decode-03-pp-deferred-recv.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-decode-04-hc-fused-int8.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-decode-05-moe-fused.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-decode-06-ple-gather-advise.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-decode-07-qsa-row-cache.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-mem-01-pp-embed-head.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-vision-01-streamed-tower.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-upstream-01-mamba-align-req-slot.patch \
     && patch -p1 --batch --forward < /tmp/flash-next-mtp-01-enable.patch \
-    && patch -p1 --batch --forward < /tmp/flash-next-mtp-02-prefix-cache.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-mtp-02-three-cards.patch \
+    && patch -p1 --batch --forward < /tmp/flash-next-mtp-03-structured-output-drafts.patch \
     && rm /tmp/flash-next-vllm.patch \
           /tmp/flash-next-decode-01-ple-host-gather.patch \
           /tmp/flash-next-decode-02-model-state-hook.patch \
+          /tmp/flash-next-ttft-01-ple-page-prefetch.patch \
+          /tmp/flash-next-decode-03-pp-deferred-recv.patch \
+          /tmp/flash-next-decode-04-hc-fused-int8.patch \
+          /tmp/flash-next-decode-05-moe-fused.patch \
+          /tmp/flash-next-decode-06-ple-gather-advise.patch \
+          /tmp/flash-next-decode-07-qsa-row-cache.patch \
+          /tmp/flash-next-mem-01-pp-embed-head.patch \
+          /tmp/flash-next-vision-01-streamed-tower.patch \
+          /tmp/flash-next-upstream-01-mamba-align-req-slot.patch \
           /tmp/flash-next-mtp-01-enable.patch \
-          /tmp/flash-next-mtp-02-prefix-cache.patch \
+          /tmp/flash-next-mtp-02-three-cards.patch \
+          /tmp/flash-next-mtp-03-structured-output-drafts.patch \
     && python3 -m py_compile \
         vllm/models/qwen4_exp/nvidia/model.py \
         vllm/models/qwen4_exp/nvidia/hyperconnection.py \
         vllm/models/qwen4_exp/nvidia/ngram_embedding.py \
         vllm/models/qwen4_exp/nvidia/model_state.py \
-        vllm/models/qwen4_exp/nvidia/mtp.py \
         vllm/models/qwen4_exp/nvidia/qsa.py \
         vllm/models/qwen4_exp/nvidia/ops/qsa.py \
+        vllm/models/qwen4_exp/nvidia/mtp.py \
         vllm/model_executor/models/config.py \
         vllm/v1/core/kv_cache_utils.py \
-        vllm/platforms/interface.py
+        vllm/platforms/interface.py \
+        vllm/v1/worker/gpu_worker.py \
+        vllm/v1/worker/gpu/spec_decode/utils.py \
+        vllm/v1/worker/gpu/model_runner.py \
+        vllm/v1/worker/gpu/model_states/mamba_hybrid.py \
+        vllm/v1/worker/mamba_utils.py
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \

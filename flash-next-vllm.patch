@@ -1,3 +1,7 @@
+If you would like to merge this patch upstream, I would appreciate it if you could keep me credited as the commit author, or add the following trailer to the commit message: 
+
+Co-authored-by: Minachist <84688797+aiueonicked@users.noreply.github.com>
+
 Qwen3.8-Flash-Next support for vLLM 0.29.1rc1.dev47+gdc36fcce9
 
 Apply from the directory that contains the `vllm` package:
@@ -286,7 +290,27 @@ Copyright 2026 Minachist
          if isinstance(quant_config, ModelOptMixedPrecisionConfig):
              if quant_config._resolve_quant_algo(prefix) == "FP8":
                  return Qwen4ExpPLEFp8EmbeddingMethod()
-@@ -532,6 +571,227 @@
+@@ -207,6 +246,11 @@
+             )
+         return Qwen4ExpPLEFp8EmbeddingMethod()
+ 
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        finalize = getattr(layer, "finalize_mmap_cache", None)
++        if finalize is not None:
++            finalize(strict=True)
++
+     def apply(
+         self,
+         layer: nn.Module,
+@@ -304,6 +348,7 @@
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+         """Reject FP8 PLE checkpoints without a global scale."""
++        super().process_weights_after_loading(layer)
+         sentinel = torch.finfo(torch.float32).min
+         if torch.any(layer.weight_scale == sentinel):
+             raise ValueError("FP8 PLE checkpoint is missing its global scale")
+@@ -532,6 +577,264 @@
          return output
  
  
@@ -299,17 +323,19 @@ Copyright 2026 Minachist
 +
 +
 +class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
-+    """PLE table left on disk and gathered on the host through a mmap.
++    """PLE table kept on disk and gathered on the host through a mmap.
 +
-+    The file is a raw, C-contiguous ``[num_embeddings_padded, embedding_dim]``
-+    array in the checkpoint's storage dtype -- the ``shard_0 .. shard_N`` PLE
-+    tensors concatenated in index order. ``VLLM_PLE_MMAP_PATH`` points at it;
-+    a missing file is created and filled while the checkpoint loads, and an
-+    existing one of the expected size is mapped copy-on-write and left alone.
++    ``VLLM_PLE_MMAP_PATH`` names a raw C-contiguous
++    ``[num_embeddings_padded, embedding_dim]`` array in the checkpoint's
++    storage dtype. It is the ``shard_0 .. shard_N`` tensors concatenated in
++    index order. A missing file is created and filled while the checkpoint
++    loads. An existing file of the right size is mapped copy-on-write and not
++    written. Sparse files are refilled instead of treated as valid caches.
++    Completion requires every checkpoint row, across all loader visits.
 +    ``VLLM_PLE_MMAP_REBUILD=1`` forces a refill.
 +
-+    Requires ETP=1 and a cudagraph mode of NONE, or PIECEWISE with
-+    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``; both are checked here.
++    Requires ETP=1, and cudagraph mode NONE or PIECEWISE with
++    ``VLLM_USE_BREAKABLE_CUDAGRAPH=1``.
 +    """
 +
 +    def __init__(
@@ -332,9 +358,9 @@ Copyright 2026 Minachist
 +            )
 +        self._mmap_array: "np.memmap | None" = None
 +        self._mmap_prefilled = False
-+        # Skips Qwen4ExpPLEPinnedHostEmbedding.__init__, which requires UVA and
-+        # builds an accelerator view of pinned memory. Everything else it
-+        # defines (start_prefetch / _finalize_prefetch / forward) is reused.
++        self._mmap_loaded_ranges: list[tuple[int, int]] = []
++        # Skip Qwen4ExpPLEPinnedHostEmbedding.__init__, which requires UVA. The
++        # other methods of that class are reused.
 +        Qwen4ExpPLEEmbedding.__init__(
 +            self,
 +            num_embeddings,
@@ -415,6 +441,15 @@ Copyright 2026 Minachist
 +                    "the stale file."
 +                )
 +        rebuild = os.environ.get(_PLE_MMAP_REBUILD_ENV, "0").strip() not in ("", "0")
++        # truncate() creates a correctly sized sparse file without table data.
++        # Legacy zero/partial caches must not be trusted just because size fits.
++        # A complete raw table is dense, including the checkpoint's padded rows.
++        if exists and os.stat(path).st_blocks * 512 < nbytes:
++            logger.warning(
++                "PLE mmap table %s is sparse/incomplete; refilling from checkpoint",
++                path,
++            )
++            rebuild = True
 +        self._mmap_prefilled = exists and not rebuild
 +        if not exists:
 +            parent = os.path.dirname(os.path.abspath(path))
@@ -429,7 +464,7 @@ Copyright 2026 Minachist
 +            mode=mode,
 +            shape=(num_embeddings, embedding_dim),
 +        )
-+        # The lookup is a scattered row gather, so readahead is pure waste.
++        # Rows are read at random offsets, so readahead is turned off.
 +        raw_map = getattr(self._mmap_array, "_mmap", None)
 +        if raw_map is not None and hasattr(raw_map, "madvise"):
 +            try:
@@ -452,13 +487,39 @@ Copyright 2026 Minachist
 +        checkpoint_start: int | None = None,
 +    ) -> None:
 +        """Skip the copy when the mapped file already holds the table."""
-+        if self._mmap_prefilled:
++        if self._mmap_prefilled and param is self.weight:
 +            return
 +        super().weight_loader(param, loaded_weight, checkpoint_start)
++        # FP8's global scale uses this loader too, but is not a table row.
++        if param is not self.weight:
++            return
++        # Record successful copies across *all* AutoWeightsLoader visits. Its
++        # prefix grouping can call the PLE module first for hash buffers, then
++        # again for each group of n-gram shards from the extra files. Count row
++        # coverage, not visits/shards: duplicates must not hide a missing range.
++        start = 0 if checkpoint_start is None else checkpoint_start
++        end = min(start + loaded_weight.shape[0], self.org_vocab_size)
++        if start < end:
++            ranges = sorted([*self._mmap_loaded_ranges, (start, end)])
++            merged: list[tuple[int, int]] = []
++            for lo, hi in ranges:
++                if merged and lo <= merged[-1][1]:
++                    merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
++                else:
++                    merged.append((lo, hi))
++            self._mmap_loaded_ranges = merged
 +
-+    def finalize_mmap_cache(self) -> None:
-+        """Flush a freshly filled table so the next run can skip loading."""
++    def finalize_mmap_cache(self, *, strict: bool = False) -> None:
++        """Flush only a complete table; reject missing rows after model load."""
 +        if self._mmap_prefilled or self._mmap_array is None:
++            return
++        if self._mmap_loaded_ranges != [(0, self.org_vocab_size)]:
++            if strict:
++                rows = sum(hi - lo for lo, hi in self._mmap_loaded_ranges)
++                raise RuntimeError(
++                    f"PLE mmap table {self._mmap_path} is incomplete: loaded "
++                    f"{rows}/{self.org_vocab_size} rows from checkpoint"
++                )
 +            return
 +        self._mmap_array.flush()
 +        self._mmap_prefilled = True
@@ -495,7 +556,7 @@ Copyright 2026 Minachist
 +                    f"PLE host staging buffer holds {self._host_stage.shape[0]} "
 +                    f"rows but {count} were requested"
 +                )
-+            # Host gather: needs the ids on the CPU, hence a device sync.
++            # Copying the ids to the CPU synchronizes with the device.
 +            ids = flat_ids.to(device="cpu", dtype=torch.int64).numpy()
 +            vocab_start = self.shard_indices.org_vocab_start_index
 +            vocab_end = self.shard_indices.org_vocab_end_index
@@ -514,7 +575,7 @@ Copyright 2026 Minachist
  class Qwen4ExpNGramEmbedding(nn.Module):
      _MASK64 = (1 << 64) - 1
      _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
-@@ -700,11 +960,12 @@
+@@ -700,11 +1003,12 @@
          if params_dtype is None:
              params_dtype = torch.get_default_dtype()
          engram_config = get_current_vllm_config().engram_config
@@ -532,7 +593,7 @@ Copyright 2026 Minachist
          self.ngram_embedding = embedding_cls(
              padded_vocab_size,
              self.head_dim,
-@@ -931,6 +1192,9 @@
+@@ -931,6 +1235,9 @@
  
          if regular_weights:
              loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
@@ -620,8 +681,8 @@ Copyright 2026 Minachist
          group_spec = group.kv_cache_spec
          layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
          if isinstance(group_spec, UniformTypeKVCacheSpecs):
-+            # A group projected onto a pipeline rank that owns none of its
-+            # layers keeps the global spec dict, so iterate layer_names.
++            # kv_cache_specs lists the layers of all pipeline ranks. Keep only
++            # this group's layers on this rank, which can be none.
 +            owned = set(group.layer_names)
              for layer_name, spec in group_spec.kv_cache_specs.items():
 -                layers_by_spec[spec].append(layer_name)
@@ -640,11 +701,117 @@ Copyright 2026 Minachist
  from typing import ClassVar, cast
  
  import torch
-@@ -92,6 +93,72 @@
+@@ -92,6 +93,180 @@
          return False
  
  
 +_QSA_STAGE_MIN_ROWS = 64
++
++# Default prefill staging arena (see ops/qsa.py). 96 MiB is 4 KV blocks at the
++# 3-card block size. All published numbers were measured with this value.
++_QSA_ARENA_DEFAULT_BYTES = 96 * 1024 * 1024
++
++# Host RAM kept free after each pool is pinned. Pinned pages cannot be swapped
++# or reclaimed.
++_QSA_HOST_RESERVE_BYTES = 4 * 2**30
++
++
++def _qsa_host_ram_available() -> int | None:
++    """Bytes of RAM this process can still pin, or None if it cannot tell."""
++    available = None
++    try:
++        with open("/proc/meminfo") as fh:
++            for line in fh:
++                if line.startswith("MemAvailable:"):
++                    available = int(line.split()[1]) * 1024
++                    break
++    except (OSError, ValueError):
++        pass
++    # A container memory limit (cgroup v2) caps it further. Page cache counts
++    # toward memory.current but can be reclaimed, so add it back.
++    try:
++        with open("/sys/fs/cgroup/memory.max") as fh:
++            limit = fh.read().strip()
++        if limit != "max":
++            with open("/sys/fs/cgroup/memory.current") as fh:
++                used = int(fh.read())
++            with open("/sys/fs/cgroup/memory.stat") as fh:
++                for line in fh:
++                    if line.startswith("file "):
++                        used -= int(line.split()[1])
++                        break
++            room = int(limit) - used
++            available = room if available is None else min(available, room)
++    except (OSError, ValueError):
++        pass
++    return available
++
++
++def _qsa_pin_host_pool(
++    shape: tuple[int, ...], nbytes: int, layer_name: str, pool_layers: int
++) -> tuple[torch.Tensor, object]:
++    """Allocate one layer's host K/V pool and pin exactly ``nbytes``.
++
++    PyTorch's caching host allocator rounds pinned sizes up to a power of two
++    unless pinned_max_round_threshold_mb is set, so a 4.03 GiB pool would pin
++    8 GiB. This uses an anonymous mapping and cudaHostRegister instead. The
++    pools live until the process exits, so no caching is needed.
++
++    All pipeline ranks on the host allocate under one file lock and check the
++    RAM available at that moment. Two ranks cannot both pass the check and
++    then run out of memory together.
++    """
++    import fcntl
++    import mmap
++    import tempfile
++
++    cap = os.environ.get("VLLM_QSA_KV_OFFLOAD_MAX_GIB", "").strip()
++    lock_path = os.path.join(tempfile.gettempdir(), "vllm-qsa-host-kv.lock")
++    with open(lock_path, "a") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        if cap:
++            # Fixed limit for all pools of the model. Replaces the RAM check.
++            budget = float(cap) * 2**30
++            if nbytes * pool_layers > budget:
++                raise RuntimeError(
++                    f"QSA host KV pool would need "
++                    f"{nbytes * pool_layers / 2**30:.2f} GiB across "
++                    f"{pool_layers} layers, exceeding "
++                    f"VLLM_QSA_KV_OFFLOAD_MAX_GIB={cap}. Lower "
++                    "--kv-cache-memory-bytes, or unset the variable to check "
++                    "against the free host RAM instead."
++                )
++        else:
++            available = _qsa_host_ram_available()
++            if (
++                available is not None
++                and nbytes + _QSA_HOST_RESERVE_BYTES > available
++            ):
++                raise RuntimeError(
++                    f"QSA host KV: {layer_name} needs {nbytes / 2**30:.2f} GiB "
++                    f"of pinned host RAM ({nbytes * pool_layers / 2**30:.1f} "
++                    f"GiB for all {pool_layers} QSA layers of the model), but "
++                    f"only {available / 2**30:.1f} GiB is available and "
++                    f"{_QSA_HOST_RESERVE_BYTES / 2**30:g} GiB is kept free. "
++                    "Lower --kv-cache-memory-bytes: host RAM, not VRAM, is what "
++                    "it buys here. Set VLLM_QSA_KV_OFFLOAD_MAX_GIB to replace "
++                    "this check with a fixed limit."
++                )
++        buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
++        if hasattr(mmap, "MADV_HUGEPAGE"):
++            try:
++                buf.madvise(mmap.MADV_HUGEPAGE)
++            except OSError:
++                pass
++        host = torch.frombuffer(buf, dtype=torch.bfloat16).view(shape)
++        err = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), nbytes, 0)
++        if err.value != 0:
++            raise RuntimeError(
++                f"QSA host KV: cudaHostRegister of {nbytes / 2**30:.2f} GiB "
++                f"for {layer_name} failed ({err}). The container needs an "
++                "unlimited memlock ulimit."
++            )
++    return host, buf
 +
 +
 +def _qsa_staged_prefill(
@@ -660,12 +827,14 @@ Copyright 2026 Minachist
 +):
 +    """Serve prefill rows from host-resident K/V through a staging arena.
 +
-+    Returns the ``(start, end)`` row range that was handled, or None to leave
-+    the whole batch to the direct path. Only the contiguous rows of a single
-+    request can be staged, so a mixed batch is served for its largest request
-+    and the remaining rows fall back to the direct path.
++    Returns the ``(start, end)`` row range it handled, or None if the whole
++    batch should use the direct path. Only the contiguous rows of one request
++    can be staged. In a mixed batch the largest request is staged and the
++    other rows use the direct path.
 +    """
 +    if not getattr(layer, "_qsa_kv_offload", False):
++        return None
++    if getattr(layer, "_qsa_stage_arena_bytes", 0) <= 0:
 +        return None
 +    min_rows = getattr(layer, "_qsa_stage_min_rows", 0)
 +    if min_rows <= 0 or num_tokens < min_rows:
@@ -713,7 +882,7 @@ Copyright 2026 Minachist
  class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
      """Run paged sparse GQA with the QSA Triton kernel."""
  
-@@ -148,16 +215,42 @@
+@@ -148,16 +323,42 @@
  
          from .ops.qsa import qsa_sparse_paged_attention
  
@@ -762,12 +931,13 @@ Copyright 2026 Minachist
          return output
  
  
-@@ -287,6 +380,22 @@
+@@ -287,6 +488,25 @@
              raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
          self.kv_sharing_target_layer_name = None
          self.kv_cache = torch.tensor([])
 +        self._qsa_kv_offload = os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") == "1"
 +        self._qsa_host_kv = None
++        self._qsa_host_buf = None
 +        self._qsa_offload_layers = sum(
 +            kind == "full_attention" for kind in config.layer_types
 +        )
@@ -779,20 +949,22 @@ Copyright 2026 Minachist
 +            if vllm_config.parallel_config.tensor_parallel_size != 1:
 +                raise NotImplementedError("QSA host KV currently requires TP=1")
 +        self._qsa_stage_min_rows = _QSA_STAGE_MIN_ROWS
++        # 0 turns staging off, and every prefill row then reads host K/V
++        # directly (about 4x slower prefill at long context).
 +        self._qsa_stage_arena_bytes = int(
-+            os.environ.get("VLLM_QSA_KVO_ARENA", str(192 * 1024 * 1024))
++            os.environ.get("VLLM_QSA_KVO_ARENA", str(_QSA_ARENA_DEFAULT_BYTES))
 +        )
          set_default_quant_scales(self, register_buffer=True)
  
          self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
-@@ -342,6 +451,44 @@
+@@ -342,8 +562,46 @@
              head_size_v=self.head_dim,
              dtype=self.kv_cache_torch_dtype,
              kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
 +            num_head_slots=1 if self._qsa_kv_offload else None,
 +            state_content_bytes=2 if self._qsa_kv_offload else None,
-+        )
-+
+         )
+ 
 +    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
 +        if not self._qsa_kv_offload:
 +            super().bind_kv_cache(kv_cache)
@@ -810,29 +982,31 @@ Copyright 2026 Minachist
 +        layer_bytes = (
 +            num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim * 2
 +        )
-+        total_bytes = layer_bytes * self._qsa_offload_layers
-+        budget = float(os.environ.get("VLLM_QSA_KV_OFFLOAD_MAX_GIB", "64")) * 2**30
-+        if total_bytes > budget:
-+            raise RuntimeError(
-+                f"QSA host KV pool would need {total_bytes / 2**30:.2f} GiB "
-+                f"across {self._qsa_offload_layers} layers, exceeding "
-+                f"VLLM_QSA_KV_OFFLOAD_MAX_GIB={budget / 2**30:g}. "
-+                "Reduce --kv-cache-memory-bytes or --num-gpu-blocks-override."
-+            )
-+        self._qsa_host_kv = torch.empty(
-+            shape, dtype=torch.bfloat16, device="cpu", pin_memory=True
++        self._qsa_host_kv, self._qsa_host_buf = _qsa_pin_host_pool(
++            shape, layer_bytes, self.layer_name, self._qsa_offload_layers
 +        )
 +        self._qsa_gpu_slots = kv_cache
 +        self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)
 +        init_logger(__name__).info(
-+            "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA)",
++            "QSA host KV %s: %d blocks x %d tokens, %.3f GiB pinned (UVA), "
++            "%.1f GiB for all %d QSA layers",
 +            self.layer_name, num_blocks, block_size, layer_bytes / 2**30,
-         )
- 
++            layer_bytes * self._qsa_offload_layers / 2**30,
++            self._qsa_offload_layers,
++        )
++        if self._qsa_stage_arena_bytes > 0:
++            # Allocate the arena now while GPU memory is free, not at the first
++            # long prefill.
++            from .ops.qsa import qsa_get_staging_arena
++
++            qsa_get_staging_arena(self.kv_cache, self._qsa_stage_arena_bytes)
++
      @eager_break_during_capture
+     def _run_qsa(
+         self,
 --- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-@@ -446,6 +446,279 @@
+@@ -446,6 +446,294 @@
      return BLOCK_N, num_warps, num_tiles, num_splits
  
  
@@ -1081,31 +1255,46 @@ Copyright 2026 Minachist
 +        )
 +
 +
-+_QSA_ARENA_CACHE: dict[tuple, torch.Tensor] = {}
++_QSA_ARENA_CACHE: dict[tuple, torch.Tensor | None] = {}
 +
 +
 +def qsa_get_staging_arena(
 +    kv_cache: torch.Tensor, arena_bytes: int
 +) -> torch.Tensor | None:
-+    """Staging arena, shared by every layer on a rank.
++    """Return the staging arena shared by all layers on this rank.
 +
-+    The layers of one forward pass run in sequence, so a single arena can be
-+    reused instead of holding one resident buffer per layer.
++    Layers run one after another, so one arena is enough. Its size is rounded
++    down to whole KV blocks, with a minimum of one. If allocation fails, the
++    failure is cached and logged once, and prefill uses the direct path.
 +    """
 +    page_bytes = kv_cache[0].numel() * kv_cache.element_size()
 +    pages = qsa_staged_arena_pages(arena_bytes, page_bytes)
 +    key = (kv_cache.device, kv_cache.dtype, pages, tuple(kv_cache.shape[1:]))
-+    arena = _QSA_ARENA_CACHE.get(key)
-+    if arena is None:
-+        try:
-+            arena = torch.empty(
-+                (pages, *kv_cache.shape[1:]),
-+                dtype=kv_cache.dtype,
-+                device=kv_cache.device,
-+            )
-+        except torch.OutOfMemoryError:
-+            return None
-+        _QSA_ARENA_CACHE[key] = arena
++    if key in _QSA_ARENA_CACHE:
++        return _QSA_ARENA_CACHE[key]
++    from vllm.logger import init_logger
++
++    logger = init_logger(__name__)
++    try:
++        arena = torch.empty(
++            (pages, *kv_cache.shape[1:]),
++            dtype=kv_cache.dtype,
++            device=kv_cache.device,
++        )
++    except torch.OutOfMemoryError:
++        arena = None
++        logger.warning(
++            "QSA staging arena of %d blocks (%.0f MiB) does not fit on %s; "
++            "prefill reads host K/V row by row instead, which is several "
++            "times slower. Lower VLLM_QSA_KVO_ARENA or --kv-cache-memory-bytes.",
++            pages, pages * page_bytes / 2**20, kv_cache.device,
++        )
++    else:
++        logger.info(
++            "QSA staging arena: %d blocks x %d tokens, %.0f MiB on %s",
++            pages, kv_cache.shape[2], pages * page_bytes / 2**20, kv_cache.device,
++        )
++    _QSA_ARENA_CACHE[key] = arena
 +    return arena
 +
 +
@@ -1121,8 +1310,8 @@ Copyright 2026 Minachist
 +def _qsa_offload_bytes_per_token_per_layer(vllm_config: "VllmConfig") -> int:
 +    """GPU-resident bytes per token per full-attention layer under QSA offload.
 +
-+    The main K/V lives on the host; the GPU keeps a 2-byte slot plus the
-+    pooled index key of ``indexer_kv_heads * (indexer_head_dim //
++    The main K/V is on the host. The GPU keeps a 2-byte slot and the pooled
++    index key of ``indexer_kv_heads * (indexer_head_dim //
 +    indexer_compress_ratio)`` elements.
 +    """
 +    text_config = vllm_config.model_config.hf_text_config
